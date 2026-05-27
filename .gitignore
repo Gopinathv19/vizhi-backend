@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Database files
+*.db
+*.sqlite3
+
+# Optional: VSCode settings
+.vscode/
+
+# Optional: environment variables
+.env
