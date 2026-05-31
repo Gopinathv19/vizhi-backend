@@ -25,14 +25,20 @@ def _agent_to_response(row: AgentRow) -> AgentResponse:
         agent_id=row.agent_id,
         name=row.name,
         description=row.description or "",
-        owner=row.owner or "",
         tags=tags if isinstance(tags, list) else [],
         status=row.status,
-        preferred_model=row.preferred_model,
         masked_key=row.masked_key,
         created_at=row.created_at.isoformat() if row.created_at else "",
         updated_at=row.updated_at.isoformat() if row.updated_at else "",
     )
+
+
+async def _generate_agent_cid(db: AsyncSession) -> str:
+    while True:
+        cid = f"ag_{uuid.uuid4().hex[:10]}"
+        existing = await db.execute(select(AgentRow.id).where(AgentRow.agent_id == cid))
+        if existing.scalar_one_or_none() is None:
+            return cid
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -41,30 +47,19 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ) -> AgentCreatedResponse:
     """Create a new agent and generate an API key."""
-    # Check for duplicate agent_id (cid).
-    existing = await db.execute(
-        select(AgentRow).where(AgentRow.agent_id == body.cid)
-    )
-    if existing.scalars().first():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Agent with CID '{body.cid}' already exists",
-        )
-
+    cid = await _generate_agent_cid(db)
     raw_key = generate_api_key()
     tags = [t.strip() for t in body.tags.split(",") if t.strip()] if body.tags else []
 
     row = AgentRow(
         id=uuid.uuid4().hex[:12],
-        agent_id=body.cid,
+        agent_id=cid,
         name=body.name,
         description=body.description,
         api_key_hash=hash_api_key(raw_key),
         masked_key=mask_api_key(raw_key),
-        owner=body.owner,
         tags=json.dumps(tags),
         status="active",
-        preferred_model=body.preferred_model,
     )
     db.add(row)
     await db.flush()
@@ -117,12 +112,8 @@ async def update_agent(
         row.name = body.name
     if body.description is not None:
         row.description = body.description
-    if body.owner is not None:
-        row.owner = body.owner
     if body.tags is not None:
         row.tags = json.dumps([t.strip() for t in body.tags.split(",") if t.strip()])
-    if body.preferred_model is not None:
-        row.preferred_model = body.preferred_model
     if body.status is not None:
         row.status = body.status
 
@@ -135,12 +126,11 @@ async def delete_agent(
     agent_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Soft-delete (archive) an agent."""
+    """Delete an agent by its CID."""
     result = await db.execute(
         select(AgentRow).where(AgentRow.agent_id == agent_id)
     )
     row = result.scalars().first()
     if not row:
         raise HTTPException(status_code=404, detail="Agent not found")
-    row.status = "archived"
-    await db.flush()
+    await db.delete(row)

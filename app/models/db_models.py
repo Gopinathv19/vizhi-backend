@@ -24,7 +24,6 @@ class AgentRow(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     api_key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     masked_key: Mapped[str] = mapped_column(Text, nullable=False)
-    owner: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[str] = mapped_column(Text, default="[]")   
     status: Mapped[str] = mapped_column(Text, default="active")
     created_at: Mapped[_dt.datetime] = mapped_column(

@@ -50,10 +50,8 @@ class AgentResponse(BaseModel):
     agent_id: str
     name: str
     description: str
-    owner: str
     tags: list[str]
     status: str
-    preferred_model: str | None = None
     masked_key: str
     created_at: str
     updated_at: str
