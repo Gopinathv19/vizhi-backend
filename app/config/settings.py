@@ -17,7 +17,16 @@ class Settings(BaseSettings):
     # ── Database ────────────────────────────────────────────────────────
     database_url: str = "sqlite+aiosqlite:///./vizhi.db"
 
-    # ── Provider API Keys ───────────────────────────────────────────────
+    # ── Inference routing ───────────────────────────────────────────────
+    inference_backend: str = "huggingface"
+    inference_model_map: str = ""
+    hf_token: str = ""
+    huggingface_api_key: str = ""
+    huggingface_base_url: str = "https://router.huggingface.co/v1"
+    custom_inference_api_key: str = ""
+    custom_inference_base_url: str = ""
+
+    # ── Legacy provider API keys ────────────────────────────────────────
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
@@ -27,7 +36,12 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
 
     # ── CORS ────────────────────────────────────────────────────────────
-    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.0.9:3000"
+    cors_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:3001,http://127.0.0.1:3001,"
+        "http://localhost:3002,http://127.0.0.1:3002,"
+        "http://192.168.0.9:3000"
+    )
 
     # ── API Key Generation ──────────────────────────────────────────────
     api_key_prefix: str = "vz_live_"

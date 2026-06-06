@@ -15,6 +15,81 @@ from app.schemas.requests import CreateModelConnectionRequest
 from app.schemas.responses import ModelConnectionCreatedResponse, ModelConnectionResponse
 
 router = APIRouter(prefix="/v1/models", tags=["models"])
+
+
+_MODEL_CATALOG: list[dict] = [
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "models": [
+            {"id": "openai/gpt-4o", "label": "gpt-4o"},
+            {"id": "openai/gpt-4o-mini", "label": "gpt-4o-mini"},
+            {"id": "openai/gpt-4.1", "label": "gpt-4.1"},
+            {"id": "openai/gpt-4.1-mini", "label": "gpt-4.1-mini"},
+            {"id": "openai/gpt-4.1-nano", "label": "gpt-4.1-nano"},
+            {"id": "openai/o3", "label": "o3"},
+            {"id": "openai/o3-mini", "label": "o3-mini"},
+            {"id": "openai/o4-mini", "label": "o4-mini"},
+        ],
+    },
+    {
+        "id": "claude",
+        "label": "Claude",
+        "models": [
+            {"id": "anthropic/claude-sonnet-4-20250514", "label": "claude-sonnet-4"},
+            {"id": "anthropic/claude-3-5-sonnet-20241022", "label": "claude-3.5-sonnet"},
+            {"id": "anthropic/claude-3-5-haiku-20241022", "label": "claude-3.5-haiku"},
+            {"id": "anthropic/claude-3-haiku-20240307", "label": "claude-3-haiku"},
+        ],
+    },
+    {
+        "id": "llama",
+        "label": "Llama",
+        "models": [
+            {
+                "id": "llama/meta-llama/Llama-3.1-8B-Instruct",
+                "label": "Llama 3.1 8B Instruct",
+            },
+            {
+                "id": "llama/meta-llama/Llama-3.2-3B-Instruct",
+                "label": "Llama 3.2 3B Instruct",
+            },
+        ],
+    },
+    {
+        "id": "mistral",
+        "label": "Mistral",
+        "models": [
+            {
+                "id": "mistral/mistralai/Mistral-7B-Instruct-v0.3",
+                "label": "Mistral 7B Instruct",
+            },
+            {
+                "id": "mistral/mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "label": "Mixtral 8x7B Instruct",
+            },
+        ],
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "models": [
+            {
+                "id": "deepseek/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                "label": "DeepSeek R1 Distill Qwen 7B",
+            },
+        ],
+    },
+]
+
+
+def _catalog_model_ids(provider_id: str) -> set[str]:
+    for provider in _MODEL_CATALOG:
+        if provider["id"] == provider_id:
+            return {model["id"] for model in provider["models"]}
+    return set()
+
+
 def _row_to_response(row: ModelConnectionRow) -> ModelConnectionResponse:
     return ModelConnectionResponse(
         id=row.id,
@@ -32,11 +107,18 @@ async def create_model_connection(
     body: CreateModelConnectionRequest,
     db: AsyncSession = Depends(get_db),
 ) -> ModelConnectionCreatedResponse:
+    provider_id = body.provider.lower()
+    if body.model_name not in _catalog_model_ids(provider_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model is not available for the selected provider",
+        )
+
     raw_key = generate_api_key()
 
     row = ModelConnectionRow(
         id=f"mt_{uuid.uuid4().hex[:8]}",
-        provider=body.provider.lower(),
+        provider=provider_id,
         model_name=body.model_name,
         api_key_hash=hash_api_key(raw_key),
         masked_key=mask_api_key(raw_key),
@@ -64,27 +146,8 @@ async def list_models(
 
 @router.get("/registry")
 async def model_registry() -> list[dict]:
-    """Return the static registry of all known models across providers."""
-    return [
-        {"model": "gpt-4o", "provider": "openai"},
-        {"model": "gpt-4o-mini", "provider": "openai"},
-        {"model": "gpt-4.1", "provider": "openai"},
-        {"model": "gpt-4.1-mini", "provider": "openai"},
-        {"model": "gpt-4.1-nano", "provider": "openai"},
-        {"model": "o3", "provider": "openai"},
-        {"model": "o3-mini", "provider": "openai"},
-        {"model": "o4-mini", "provider": "openai"},
-        {"model": "claude-sonnet-4-20250514", "provider": "anthropic"},
-        {"model": "claude-3-5-sonnet-20241022", "provider": "anthropic"},
-        {"model": "claude-3-5-haiku-20241022", "provider": "anthropic"},
-        {"model": "claude-3-haiku-20240307", "provider": "anthropic"},
-        {"model": "gemini-2.5-flash", "provider": "gemini"},
-        {"model": "gemini-2.5-pro", "provider": "gemini"},
-        {"model": "gemini-2.0-flash", "provider": "gemini"},
-        {"model": "qwen-max", "provider": "qwen"},
-        {"model": "qwen-plus", "provider": "qwen"},
-        {"model": "qwen-turbo", "provider": "qwen"},
-    ]
+    """Return provider/model options for client dropdowns."""
+    return _MODEL_CATALOG
 
 @router.delete("/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_model_connection(

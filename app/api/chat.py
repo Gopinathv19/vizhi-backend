@@ -9,9 +9,8 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.api_key import resolve_agent
+from app.auth.api_key import ChatCredential, resolve_chat_credential
 from app.db.session import get_db
-from app.models.db_models import AgentRow
 from app.schemas.requests import ChatCompletionRequest
 from app.schemas.responses import (
     ChatChoice,
@@ -29,7 +28,7 @@ router = APIRouter(prefix="/v1", tags=["chat"])
 @router.post("/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
-    agent: AgentRow = Depends(resolve_agent),
+    credential: ChatCredential = Depends(resolve_chat_credential),
     db: AsyncSession = Depends(get_db),
 ) -> ChatCompletionResponse:
     """OpenRouter-style chat completion gateway.
@@ -42,9 +41,24 @@ async def chat_completions(
     5. Persist response
     6. Return OpenAI-compatible response
     """
+    requested_model = body.model
+    token_model = credential.model_name
+    if token_model and requested_model and requested_model != token_model:
+        raise HTTPException(
+            status_code=400,
+            detail="Requested model does not match the model bound to this token",
+        )
+
+    model_name = token_model or requested_model
+    if not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Model is required when using an agent token",
+        )
+
     # 2. Resolve provider
     try:
-        provider, resolved_model = provider_router.resolve(body.model, body.call_sdk)
+        provider, resolved_model = provider_router.resolve(model_name, body.call_sdk)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -52,7 +66,7 @@ async def chat_completions(
     messages_raw = [m.model_dump() for m in body.messages]
     query_row = await persist_query(
         db,
-        agent_id=agent.agent_id,
+        agent_id=credential.principal_id,
         provider=provider.provider_name,
         model=resolved_model,
         sdk_type=body.call_sdk,
@@ -110,7 +124,7 @@ async def chat_completions(
             total_tokens=result.input_tokens + result.output_tokens,
         ),
         vizhi_metadata=VizhiMetadata(
-            agent_id=agent.agent_id,
+            agent_id=credential.principal_id,
             provider=result.provider,
             latency_ms=result.latency_ms,
             query_id=query_row.id,

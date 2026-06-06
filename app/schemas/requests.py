@@ -14,7 +14,13 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field(..., examples=["openai/gpt-4o-mini", "claude-sonnet-4"])
+    model: str | None = Field(
+        None,
+        examples=["openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514"],
+        description=(
+            "Optional for model-token calls. Agent-token calls must provide it."
+        ),
+    )
     messages: list[ChatMessage]
     call_sdk: str | None = Field(
         None,

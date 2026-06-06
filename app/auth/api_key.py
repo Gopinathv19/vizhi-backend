@@ -7,6 +7,7 @@ import secrets
 import uuid
 
 import bcrypt
+from dataclasses import dataclass
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from sqlalchemy import select
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
 from app.db.session import get_db
-from app.models.db_models import AgentRow
+from app.models.db_models import AgentRow, ModelConnectionRow
 
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -49,16 +50,16 @@ def _fast_hash(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode()).hexdigest()
 
 
-async def resolve_agent(
-    authorization: str | None = Security(_api_key_header),
-    db: AsyncSession = Depends(get_db),
-) -> AgentRow:
-    """FastAPI dependency – validates the API key and returns the Agent.
+@dataclass(frozen=True)
+class ChatCredential:
+    """Authenticated credential used by the chat gateway."""
 
-    Expects header::
+    principal_id: str
+    token_type: str
+    model_name: str | None = None
 
-        Authorization: Bearer vz_live_xxxxxxxx
-    """
+
+def _extract_bearer_token(authorization: str | None) -> str:
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -71,6 +72,20 @@ async def resolve_agent(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Authorization header format",
         )
+    return raw_key
+
+
+async def resolve_agent(
+    authorization: str | None = Security(_api_key_header),
+    db: AsyncSession = Depends(get_db),
+) -> AgentRow:
+    """FastAPI dependency – validates the API key and returns the Agent.
+
+    Expects header::
+
+        Authorization: Bearer vz_live_xxxxxxxx
+    """
+    raw_key = _extract_bearer_token(authorization)
 
     # Scan agents and bcrypt-verify.  For P0 scale this is fine;
     # P1 adds a SHA-256 fingerprint column for indexed lookup.
@@ -80,6 +95,43 @@ async def resolve_agent(
     for agent in agents:
         if verify_api_key(raw_key, agent.api_key_hash):
             return agent
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key",
+    )
+
+
+async def resolve_chat_credential(
+    authorization: str | None = Security(_api_key_header),
+    db: AsyncSession = Depends(get_db),
+) -> ChatCredential:
+    """Validate a chat token.
+
+    Model tokens are preferred for chat calls because they are already bound to
+    a specific provider/model. Agent tokens are accepted as a compatibility path
+    and must still provide a model in the request body.
+    """
+    raw_key = _extract_bearer_token(authorization)
+
+    model_result = await db.execute(
+        select(ModelConnectionRow).where(ModelConnectionRow.status == "active")
+    )
+    for model_connection in model_result.scalars().all():
+        if verify_api_key(raw_key, model_connection.api_key_hash):
+            return ChatCredential(
+                principal_id=model_connection.id,
+                token_type="model",
+                model_name=model_connection.model_name,
+            )
+
+    agent_result = await db.execute(select(AgentRow).where(AgentRow.status == "active"))
+    for agent in agent_result.scalars().all():
+        if verify_api_key(raw_key, agent.api_key_hash):
+            return ChatCredential(
+                principal_id=agent.agent_id,
+                token_type="agent",
+            )
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
