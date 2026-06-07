@@ -22,6 +22,7 @@ async def _sync_sqlite_agents_schema(conn) -> None:
         """
         CREATE TABLE agents_new (
             id TEXT NOT NULL,
+            user_id TEXT,
             agent_id TEXT NOT NULL,
             name TEXT NOT NULL,
             description TEXT NOT NULL,
@@ -40,6 +41,7 @@ async def _sync_sqlite_agents_schema(conn) -> None:
         """
         INSERT INTO agents_new (
             id,
+            user_id,
             agent_id,
             name,
             description,
@@ -52,6 +54,7 @@ async def _sync_sqlite_agents_schema(conn) -> None:
         )
         SELECT
             id,
+            user_id,
             agent_id,
             name,
             description,
@@ -69,9 +72,43 @@ async def _sync_sqlite_agents_schema(conn) -> None:
     await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
+async def _ensure_sqlite_column(
+    conn,
+    *,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+    columns = {row[1] for row in result.fetchall()}
+    if column_name in columns:
+        return
+    await conn.exec_driver_sql(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+    )
+
+
 async def init_db() -> None:
     """Create tables if they don't exist yet."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         if settings.database_url.startswith("sqlite"):
+            await _ensure_sqlite_column(
+                conn,
+                table_name="agents",
+                column_name="user_id",
+                column_definition="TEXT",
+            )
+            await _ensure_sqlite_column(
+                conn,
+                table_name="model_connections",
+                column_name="user_id",
+                column_definition="TEXT",
+            )
+            await _ensure_sqlite_column(
+                conn,
+                table_name="queries",
+                column_name="user_id",
+                column_definition="TEXT",
+            )
             await _sync_sqlite_agents_schema(conn)

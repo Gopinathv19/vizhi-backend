@@ -35,6 +35,7 @@ async def persist_query(
     db: AsyncSession,
     *,
     agent_id: str,
+    user_id: str | None,
     provider: str,
     model: str,
     sdk_type: str | None,
@@ -44,6 +45,7 @@ async def persist_query(
     """Save an incoming query before calling the provider."""
     row = QueryRow(
         id=f"q_{_id()}",
+        user_id=user_id,
         agent_id=agent_id,
         provider=provider,
         model=model,
@@ -101,12 +103,13 @@ async def persist_response(
 
 
 async def get_recent_requests(
-    db: AsyncSession, limit: int = 50
+    db: AsyncSession, limit: int = 50, user_id: str | None = None
 ) -> list[RequestEventResponse]:
     """Fetch recent queries + responses joined, for dashboard display."""
-    q_result = await db.execute(
-        select(QueryRow).order_by(desc(QueryRow.timestamp)).limit(limit)
-    )
+    stmt = select(QueryRow).order_by(desc(QueryRow.timestamp)).limit(limit)
+    if user_id is not None:
+        stmt = stmt.where(QueryRow.user_id == user_id)
+    q_result = await db.execute(stmt)
     queries = q_result.scalars().all()
 
     items: list[RequestEventResponse] = []
@@ -134,17 +137,26 @@ async def get_recent_requests(
     return items
 
 
-async def build_dashboard(db: AsyncSession) -> DashboardResponse:
+async def build_dashboard(db: AsyncSession, user_id: str) -> DashboardResponse:
     """Build the full dashboard payload consumed by the frontend."""
     # Totals
-    agent_count = (await db.execute(select(func.count(AgentRow.id)))).scalar() or 0
+    agent_count = (
+        await db.execute(
+            select(func.count(AgentRow.id)).where(AgentRow.user_id == user_id)
+        )
+    ).scalar() or 0
     model_count = (
-        await db.execute(select(func.count(ModelConnectionRow.id)))
+        await db.execute(
+            select(func.count(ModelConnectionRow.id)).where(
+                ModelConnectionRow.user_id == user_id
+            )
+        )
     ).scalar() or 0
     active_models = (
         await db.execute(
             select(func.count(ModelConnectionRow.id)).where(
-                ModelConnectionRow.status == "active"
+                ModelConnectionRow.status == "active",
+                ModelConnectionRow.user_id == user_id,
             )
         )
     ).scalar() or 0
@@ -154,17 +166,20 @@ async def build_dashboard(db: AsyncSession) -> DashboardResponse:
     today_queries = (
         await db.execute(
             select(func.count(QueryRow.id)).where(QueryRow.timestamp >= today_start)
+            .where(QueryRow.user_id == user_id)
         )
     ).scalar() or 0
 
+    owned_query_ids = select(QueryRow.id).where(QueryRow.user_id == user_id)
     token_result = await db.execute(
         select(
             func.coalesce(func.sum(ResponseRow.input_tokens), 0),
             func.coalesce(func.sum(ResponseRow.output_tokens), 0),
-            func.count(
-                case((ResponseRow.status_code >= 400, ResponseRow.id))
-            ),
-        ).where(ResponseRow.timestamp >= today_start)
+            func.count(case((ResponseRow.status_code >= 400, ResponseRow.id))),
+        ).where(
+            ResponseRow.timestamp >= today_start,
+            ResponseRow.query_id.in_(owned_query_ids),
+        )
     )
     token_row = token_result.one()
     total_input = token_row[0]
@@ -181,10 +196,10 @@ async def build_dashboard(db: AsyncSession) -> DashboardResponse:
     )
 
     # Metric time series — bucket by 3-hour intervals for last 24h
-    metric_series = await _build_timeseries(db, today_start)
+    metric_series = await _build_timeseries(db, today_start, user_id=user_id)
 
     # Recent requests
-    recent = await get_recent_requests(db, limit=20)
+    recent = await get_recent_requests(db, limit=20, user_id=user_id)
 
     return DashboardResponse(
         totals=totals,
@@ -193,38 +208,45 @@ async def build_dashboard(db: AsyncSession) -> DashboardResponse:
     )
 
 
-async def build_metrics(db: AsyncSession) -> MetricsResponse:
+async def build_metrics(db: AsyncSession, user_id: str) -> MetricsResponse:
     """Build metrics response for /v1/metrics."""
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    series = await _build_timeseries(db, today_start)
-    recent = await get_recent_requests(db, limit=50)
+    series = await _build_timeseries(db, today_start, user_id=user_id)
+    recent = await get_recent_requests(db, limit=50, user_id=user_id)
     return MetricsResponse(metric_series=series, requests=recent)
 
 
 async def _build_timeseries(
-    db: AsyncSession, since: _dt.datetime
+    db: AsyncSession, since: _dt.datetime, user_id: str | None = None
 ) -> list[MetricPoint]:
     """Build 3-hour bucketed metric points."""
     points: list[MetricPoint] = []
 
     for hour in range(0, 24, 3):
         bucket_start = since.replace(hour=hour)
-        bucket_end = since.replace(hour=hour + 3) if hour + 3 < 24 else since + _dt.timedelta(days=1)
-
-        result = await db.execute(
-            select(
-                func.count(ResponseRow.id),
-                func.coalesce(func.sum(ResponseRow.input_tokens), 0),
-                func.coalesce(func.sum(ResponseRow.output_tokens), 0),
-                func.coalesce(func.avg(ResponseRow.latency_ms), 0),
-                func.count(
-                    case((ResponseRow.status_code >= 400, ResponseRow.id))
-                ),
-            ).where(
-                ResponseRow.timestamp >= bucket_start,
-                ResponseRow.timestamp < bucket_end,
-            )
+        bucket_end = (
+            since.replace(hour=hour + 3)
+            if hour + 3 < 24
+            else since + _dt.timedelta(days=1)
         )
+
+        stmt = select(
+            func.count(ResponseRow.id),
+            func.coalesce(func.sum(ResponseRow.input_tokens), 0),
+            func.coalesce(func.sum(ResponseRow.output_tokens), 0),
+            func.coalesce(func.avg(ResponseRow.latency_ms), 0),
+            func.count(case((ResponseRow.status_code >= 400, ResponseRow.id))),
+        ).where(
+            ResponseRow.timestamp >= bucket_start,
+            ResponseRow.timestamp < bucket_end,
+        )
+        if user_id is not None:
+            stmt = stmt.where(
+                ResponseRow.query_id.in_(
+                    select(QueryRow.id).where(QueryRow.user_id == user_id)
+                )
+            )
+        result = await db.execute(stmt)
         row = result.one()
         points.append(
             MetricPoint(

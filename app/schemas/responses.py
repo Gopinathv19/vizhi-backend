@@ -8,6 +8,20 @@ from pydantic import BaseModel, Field
 # ── Chat Completion Response (OpenAI-compatible) ────────────────────────
 
 
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    email_verified: bool
+    name: str = ""
+    avatar_url: str = ""
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
 class ChatChoiceMessage(BaseModel):
     role: str = "assistant"
     content: str

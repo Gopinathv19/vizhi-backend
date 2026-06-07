@@ -31,6 +31,24 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = Field(None, ge=1, le=128_000)
 
 
+# ── Frontend Authentication ─────────────────────────────────────────────
+
+
+class SignupRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=8, max_length=128)
+    name: str = Field("", max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str = Field(..., min_length=20)
+
+
 # ── Agent CRUD ──────────────────────────────────────────────────────────
 
 

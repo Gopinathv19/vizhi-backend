@@ -67,6 +67,7 @@ async def chat_completions(
     query_row = await persist_query(
         db,
         agent_id=credential.principal_id,
+        user_id=credential.user_id,
         provider=provider.provider_name,
         model=resolved_model,
         sdk_type=body.call_sdk,

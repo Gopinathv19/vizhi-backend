@@ -9,8 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_key import generate_api_key, hash_api_key, mask_api_key
+from app.auth.user_auth import get_current_user
 from app.db.session import get_db
-from app.models.db_models import ModelConnectionRow
+from app.models.db_models import ModelConnectionRow, UserRow
 from app.schemas.requests import CreateModelConnectionRequest
 from app.schemas.responses import ModelConnectionCreatedResponse, ModelConnectionResponse
 
@@ -105,6 +106,7 @@ def _row_to_response(row: ModelConnectionRow) -> ModelConnectionResponse:
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_model_connection(
     body: CreateModelConnectionRequest,
+    user: UserRow = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ModelConnectionCreatedResponse:
     provider_id = body.provider.lower()
@@ -118,6 +120,7 @@ async def create_model_connection(
 
     row = ModelConnectionRow(
         id=f"mt_{uuid.uuid4().hex[:8]}",
+        user_id=user.id,
         provider=provider_id,
         model_name=body.model_name,
         api_key_hash=hash_api_key(raw_key),
@@ -136,11 +139,14 @@ async def create_model_connection(
 
 @router.get("")
 async def list_models(
+    user: UserRow = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[ModelConnectionResponse]:
     """List all registered model connections."""
     result = await db.execute(
-        select(ModelConnectionRow).order_by(ModelConnectionRow.created_at.desc())
+        select(ModelConnectionRow)
+        .where(ModelConnectionRow.user_id == user.id)
+        .order_by(ModelConnectionRow.created_at.desc())
     )
     return [_row_to_response(row) for row in result.scalars().all()]
 
@@ -152,9 +158,15 @@ async def model_registry() -> list[dict]:
 @router.delete("/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_model_connection(
     model_id: str,
+    user: UserRow = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(ModelConnectionRow).where(ModelConnectionRow.id == model_id))
+    result = await db.execute(
+        select(ModelConnectionRow).where(
+            ModelConnectionRow.id == model_id,
+            ModelConnectionRow.user_id == user.id,
+        )
+    )
     if not (row := result.scalar_one_or_none()):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model connection not found")
     await db.delete(row)

@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # ── API Key Generation ──────────────────────────────────────────────
     api_key_prefix: str = "vz_live_"
 
+    # ── Frontend user authentication ────────────────────────────────────
+    auth_jwt_secret: str = "change-me-in-production"
+    auth_jwt_issuer: str = "vizhi"
+    auth_token_ttl_minutes: int = 60 * 24 * 7
+    google_client_id: str = ""
+
     # ── Helpers ─────────────────────────────────────────────────────────
     @property
     def cors_origin_list(self) -> list[str]:

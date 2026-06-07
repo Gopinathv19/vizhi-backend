@@ -57,6 +57,7 @@ class ChatCredential:
     principal_id: str
     token_type: str
     model_name: str | None = None
+    user_id: str | None = None
 
 
 def _extract_bearer_token(authorization: str | None) -> str:
@@ -123,6 +124,7 @@ async def resolve_chat_credential(
                 principal_id=model_connection.id,
                 token_type="model",
                 model_name=model_connection.model_name,
+                user_id=model_connection.user_id,
             )
 
     agent_result = await db.execute(select(AgentRow).where(AgentRow.status == "active"))
@@ -131,6 +133,7 @@ async def resolve_chat_credential(
             return ChatCredential(
                 principal_id=agent.agent_id,
                 token_type="agent",
+                user_id=agent.user_id,
             )
 
     raise HTTPException(
