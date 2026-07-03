@@ -16,6 +16,7 @@ from app.schemas.requests import CreateModelConnectionRequest
 from app.schemas.responses import (
     ModelConnectionCreatedResponse,
     ModelConnectionResponse,
+    ModelConnectionRotatedResponse,
     ModelUsageDetailResponse,
     ModelUsageStats,
     QueryDetailItem,
@@ -102,12 +103,15 @@ def _row_to_response(row: ModelConnectionRow) -> ModelConnectionResponse:
         id=row.id,
         provider=row.provider,
         model_name=row.model_name,
+        token_name=row.token_name,
         status=row.status,
         metadata=row.metadata_,
         usage_count=row.usage_count,
         masked_key=row.masked_key,
+        last_used_at=row.last_used_at.isoformat() if row.last_used_at else None,
         created_at=row.created_at.isoformat() if row.created_at else "",
     )
+
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_model_connection(
@@ -129,6 +133,7 @@ async def create_model_connection(
         user_id=user.id,
         provider=provider_id,
         model_name=body.model_name,
+        token_name=body.token_name,
         api_key_hash=hash_api_key(raw_key),
         masked_key=mask_api_key(raw_key),
         status="active",
@@ -141,6 +146,68 @@ async def create_model_connection(
     return ModelConnectionCreatedResponse(
         model_connection=_row_to_response(row),
         api_key=raw_key,
+    )
+
+
+@router.post("/{model_id}/revoke", status_code=status.HTTP_200_OK)
+async def revoke_model_connection(
+    model_id: str,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ModelConnectionResponse:
+    """Revoke a model token — it immediately becomes unusable for authentication."""
+    result = await db.execute(
+        select(ModelConnectionRow).where(
+            ModelConnectionRow.id == model_id,
+            ModelConnectionRow.user_id == user.id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Model connection not found")
+    if row.status == "revoked":
+        raise HTTPException(status_code=409, detail="Token is already revoked")
+
+    row.status = "revoked"
+    await db.flush()
+    await db.refresh(row)
+    return _row_to_response(row)
+
+
+@router.post("/{model_id}/rotate", status_code=status.HTTP_200_OK)
+async def rotate_model_connection(
+    model_id: str,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ModelConnectionRotatedResponse:
+    """Rotate the API key for a model connection.
+
+    Generates a new cryptographically secure key, hashes it, and atomically
+    re-activates the token.  The new plaintext key is returned once — store it
+    immediately.
+    """
+    result = await db.execute(
+        select(ModelConnectionRow).where(
+            ModelConnectionRow.id == model_id,
+            ModelConnectionRow.user_id == user.id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Model connection not found")
+
+    new_raw_key = generate_api_key()
+    row.api_key_hash = hash_api_key(new_raw_key)
+    row.masked_key = mask_api_key(new_raw_key)
+    row.status = "active"
+    # Preserve: provider, model_name, token_name, metadata_, created_at, usage_count
+
+    await db.flush()
+    await db.refresh(row)
+
+    return ModelConnectionRotatedResponse(
+        model_connection=_row_to_response(row),
+        api_key=new_raw_key,
     )
 
 

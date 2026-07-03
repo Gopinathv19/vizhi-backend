@@ -104,6 +104,7 @@ class ModelConnectionRow(Base):
     )
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     model_name: Mapped[str] = mapped_column(Text, nullable=False)
+    token_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     masked_key: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, default="active")

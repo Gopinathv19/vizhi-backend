@@ -129,10 +129,12 @@ class ModelConnectionResponse(BaseModel):
     id: str
     provider: str
     model_name: str
+    token_name: str | None = None
     status: str
     metadata: str | None = None
     usage_count: int = 0
     masked_key: str
+    last_used_at: str | None = None
     created_at: str
 
 
@@ -140,6 +142,14 @@ class ModelConnectionCreatedResponse(BaseModel):
     model_connection: ModelConnectionResponse
     api_key: str = Field(
         ..., description="Full Vizhi model token returned once on creation"
+    )
+
+
+class ModelConnectionRotatedResponse(BaseModel):
+    """Returned only on rotation — includes the new raw API key once."""
+    model_connection: ModelConnectionResponse
+    api_key: str = Field(
+        ..., description="New full model token – shown only once, store securely"
     )
 
 
@@ -170,6 +180,8 @@ class RequestEventResponse(BaseModel):
     output_tokens: int
     estimated_cost: float
     error_message: str | None = None
+    prompt: list[dict] = Field(default_factory=list)
+    response_text: str = ""
 
 
 # ── Metrics ─────────────────────────────────────────────────────────────

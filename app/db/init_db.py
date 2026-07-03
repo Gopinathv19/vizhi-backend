@@ -130,6 +130,12 @@ async def init_db() -> None:
                 column_name="last_used_at",
                 column_definition="DATETIME",
             )
+            await _ensure_sqlite_column(
+                conn,
+                table_name="model_connections",
+                column_name="token_name",
+                column_definition="TEXT",
+            )
             await _sync_sqlite_agents_schema(conn)
     logger.info("✅ Local database ready")
 

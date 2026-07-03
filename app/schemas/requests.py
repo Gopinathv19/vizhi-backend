@@ -72,6 +72,7 @@ class UpdateAgentRequest(BaseModel):
 class CreateModelConnectionRequest(BaseModel):
     provider: str = Field(..., examples=["openai", "anthropic", "gemini", "qwen", "ollama"])
     model_name: str = Field(..., examples=["gpt-4o-mini"])
+    token_name: str | None = Field(None, max_length=120, description="Optional friendly label for this token")
     metadata: str | None = None
 
 

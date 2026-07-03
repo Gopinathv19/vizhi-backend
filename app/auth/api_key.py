@@ -86,10 +86,15 @@ def _extract_bearer_token(authorization: str | None) -> str:
     return raw_key
 
 
-async def _touch_agent_last_used(db: AsyncSession, agent: AgentRow) -> None:
-    """Update last_used_at timestamp. Caller's session handles the final commit."""
-    agent.last_used_at = _dt.datetime.utcnow()
+async def _touch_last_used(db: AsyncSession, row: AgentRow | ModelConnectionRow) -> None:
+    """Update last_used_at timestamp on any token row. Session commit is handled by the dependency."""
+    row.last_used_at = _dt.datetime.utcnow()
     await db.flush()
+
+
+# Back-compat alias used by agent queue auth paths
+async def _touch_agent_last_used(db: AsyncSession, agent: AgentRow) -> None:
+    await _touch_last_used(db, agent)
 
 
 async def resolve_agent(
@@ -137,6 +142,7 @@ async def resolve_chat_credential(
     )
     for model_connection in model_result.scalars().all():
         if verify_api_key(raw_key, model_connection.api_key_hash):
+            await _touch_last_used(db, model_connection)
             return ChatCredential(
                 principal_id=model_connection.id,
                 token_type="model",
