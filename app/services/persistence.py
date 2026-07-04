@@ -222,7 +222,7 @@ async def complete_agent_job(
     if job.agent_id and job.agent_id != agent_id:
         raise ValueError("Job is assigned to a different agent")
 
-    job.status = status
+    job.status = "completed"
     if error:
         job.error_message = error
     job.completed_at = _utcnow()

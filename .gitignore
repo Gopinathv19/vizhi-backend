@@ -17,3 +17,6 @@ env/
 
 # Optional: environment variables
 .env
+
+__pycache__/*
+__pycache__
