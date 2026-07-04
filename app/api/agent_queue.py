@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Response, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 

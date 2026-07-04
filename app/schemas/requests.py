@@ -56,6 +56,7 @@ class CreateAgentRequest(BaseModel):
     name: str = Field(..., min_length=2)
     description: str = Field("", min_length=0)
     tags: str = Field("", description="Comma-separated tags")
+    token_name: str | None = Field(None, max_length=120, description="Optional friendly label for this token")
 
 
 class UpdateAgentRequest(BaseModel):
@@ -71,6 +72,7 @@ class UpdateAgentRequest(BaseModel):
 class CreateModelConnectionRequest(BaseModel):
     provider: str = Field(..., examples=["openai", "anthropic", "gemini", "qwen", "ollama"])
     model_name: str = Field(..., examples=["gpt-4o-mini"])
+    token_name: str | None = Field(None, max_length=120, description="Optional friendly label for this token")
     metadata: str | None = None
 
 
