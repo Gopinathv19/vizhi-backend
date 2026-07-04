@@ -91,7 +91,7 @@ async def persist_response(
     db.add(row)
     await db.flush()
 
-    # Increment model connection usage count.
+    # Increment model connection usage count and update stats.
     if provider_response and status_code < 400:
         result = await db.execute(
             select(ModelConnectionRow).where(
@@ -102,6 +102,9 @@ async def persist_response(
         mc = result.scalars().first()
         if mc:
             mc.usage_count += 1
+            mc.last_used_at = _utcnow()
+            mc.total_tokens_consumed += (provider_response.input_tokens + provider_response.output_tokens)
+            mc.total_cost += row.estimated_cost
 
     return row
 
@@ -249,12 +252,23 @@ async def complete_agent_job(
 
 
 async def get_recent_requests(
-    db: AsyncSession, limit: int = 50, user_id: str | None = None
+    db: AsyncSession,
+    limit: int = 50,
+    user_id: str | None = None,
+    since: _dt.datetime | None = None,
+    agent_id: str | None = None,
+    model_id: str | None = None,
 ) -> list[RequestEventResponse]:
     """Fetch recent queries + responses joined, for dashboard display."""
     stmt = select(QueryRow).order_by(desc(QueryRow.timestamp)).limit(limit)
     if user_id is not None:
         stmt = stmt.where(QueryRow.user_id == user_id)
+    if since is not None:
+        stmt = stmt.where(QueryRow.timestamp >= since)
+    if agent_id is not None:
+        stmt = stmt.where(QueryRow.agent_id == agent_id)
+    if model_id is not None:
+        stmt = stmt.where(QueryRow.model == model_id)
     q_result = await db.execute(stmt)
     queries = q_result.scalars().all()
 
@@ -264,6 +278,30 @@ async def get_recent_requests(
             select(ResponseRow).where(ResponseRow.query_id == q.id)
         )
         r = r_result.scalars().first()
+
+        # Parse prompt messages from stored JSON
+        try:
+            prompt: list[dict] = json.loads(q.input_messages) if q.input_messages else []
+        except (json.JSONDecodeError, TypeError):
+            prompt = []
+
+        # Extract readable response text from the stored raw response JSON
+        response_text = ""
+        if r and r.response:
+            try:
+                resp_data = json.loads(r.response)
+                if isinstance(resp_data, dict):
+                    if "choices" in resp_data and resp_data["choices"]:
+                        choice = resp_data["choices"][0]
+                        if "message" in choice and "content" in choice["message"]:
+                            response_text = choice["message"]["content"] or ""
+                        elif "text" in choice:
+                            response_text = choice["text"] or ""
+                    elif "content" in resp_data:
+                        response_text = str(resp_data["content"])
+            except (json.JSONDecodeError, TypeError, KeyError):
+                response_text = (r.response or "")[:500]
+
         items.append(
             RequestEventResponse(
                 id=q.id,
@@ -278,6 +316,8 @@ async def get_recent_requests(
                 output_tokens=r.output_tokens if r else 0,
                 estimated_cost=r.estimated_cost if r else 0.0,
                 error_message=r.error_message if r else None,
+                prompt=prompt,
+                response_text=response_text,
             )
         )
     return items
@@ -354,27 +394,67 @@ async def build_dashboard(db: AsyncSession, user_id: str) -> DashboardResponse:
     )
 
 
-async def build_metrics(db: AsyncSession, user_id: str) -> MetricsResponse:
-    """Build metrics response for /v1/metrics."""
-    today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    series = await _build_timeseries(db, today_start, user_id=user_id)
-    recent = await get_recent_requests(db, limit=50, user_id=user_id)
+async def build_metrics(
+    db: AsyncSession,
+    user_id: str,
+    time_range: str = "24h",
+    agent_id: str | None = None,
+    model_id: str | None = None,
+) -> MetricsResponse:
+    """Build metrics response for /v1/metrics with optional filters."""
+    now = _utcnow()
+    _range_map = {
+        "1h": _dt.timedelta(hours=1),
+        "24h": _dt.timedelta(hours=24),
+        "7d": _dt.timedelta(days=7),
+        "30d": _dt.timedelta(days=30),
+    }
+    delta = _range_map.get(time_range, _dt.timedelta(hours=24))
+    since = now - delta
+
+    series = await _build_timeseries(
+        db, since, user_id=user_id, time_range=time_range,
+        agent_id=agent_id, model_id=model_id,
+    )
+    recent = await get_recent_requests(
+        db, limit=50, user_id=user_id,
+        since=since, agent_id=agent_id, model_id=model_id,
+    )
     return MetricsResponse(metric_series=series, requests=recent)
 
 
 async def _build_timeseries(
-    db: AsyncSession, since: _dt.datetime, user_id: str | None = None
+    db: AsyncSession,
+    since: _dt.datetime,
+    user_id: str | None = None,
+    time_range: str = "24h",
+    agent_id: str | None = None,
+    model_id: str | None = None,
 ) -> list[MetricPoint]:
-    """Build 3-hour bucketed metric points."""
+    """Build bucketed metric points scaled to the requested time range."""
     points: list[MetricPoint] = []
 
-    for hour in range(0, 24, 3):
-        bucket_start = since.replace(hour=hour)
-        bucket_end = (
-            since.replace(hour=hour + 3)
-            if hour + 3 < 24
-            else since + _dt.timedelta(days=1)
-        )
+    # Determine bucket count and interval based on time_range
+    _bucket_config: dict[str, tuple[int, _dt.timedelta]] = {
+        "1h":  (12, _dt.timedelta(minutes=5)),
+        "24h": (8,  _dt.timedelta(hours=3)),
+        "7d":  (7,  _dt.timedelta(days=1)),
+        "30d": (30, _dt.timedelta(days=1)),
+    }
+    bucket_count, bucket_size = _bucket_config.get(time_range, (8, _dt.timedelta(hours=3)))
+
+    for i in range(bucket_count):
+        bucket_start = since + i * bucket_size
+        bucket_end = bucket_start + bucket_size
+
+        # Build sub-query for owned query IDs with optional agent/model filters
+        owned_query_stmt = select(QueryRow.id)
+        if user_id is not None:
+            owned_query_stmt = owned_query_stmt.where(QueryRow.user_id == user_id)
+        if agent_id is not None:
+            owned_query_stmt = owned_query_stmt.where(QueryRow.agent_id == agent_id)
+        if model_id is not None:
+            owned_query_stmt = owned_query_stmt.where(QueryRow.model == model_id)
 
         stmt = select(
             func.count(ResponseRow.id),
@@ -385,18 +465,23 @@ async def _build_timeseries(
         ).where(
             ResponseRow.timestamp >= bucket_start,
             ResponseRow.timestamp < bucket_end,
+            ResponseRow.query_id.in_(owned_query_stmt),
         )
-        if user_id is not None:
-            stmt = stmt.where(
-                ResponseRow.query_id.in_(
-                    select(QueryRow.id).where(QueryRow.user_id == user_id)
-                )
-            )
+
         result = await db.execute(stmt)
         row = result.one()
+
+        # Format label based on range
+        if time_range == "1h":
+            label = bucket_start.strftime("%H:%M")
+        elif time_range in ("7d", "30d"):
+            label = bucket_start.strftime("%b %d")
+        else:
+            label = bucket_start.strftime("%H:%M")
+
         points.append(
             MetricPoint(
-                time=f"{hour:02d}:00",
+                time=label,
                 requests=row[0],
                 input_tokens=row[1],
                 output_tokens=row[2],
