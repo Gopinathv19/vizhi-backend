@@ -117,7 +117,7 @@ async def chat_completions(
                 query_row=query_row,
                 job_id=job_row.id,
                 agent_id=credential.principal_id,
-                timeout_seconds=120,
+                timeout_seconds=900,
             )
         except HTTPException:
             raise
