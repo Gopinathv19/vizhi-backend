@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import logging
 import time
@@ -77,45 +78,47 @@ async def chat_completions(
     messages_raw = [m.model_dump() for m in body.messages]
     if credential.token_type == "agent":
         try:
-            query_row = await persist_query(
-                db,
-                agent_id=credential.principal_id,
-                user_id=credential.user_id,
-                provider=provider_name,
-                model=resolved_model,
-                sdk_type=body.call_sdk,
-                messages=messages_raw,
-            )
-
-            job_row = await persist_agent_job(
-                db,
-                query_id=query_row.id,
-                user_id=credential.user_id,
-                agent_id=credential.principal_id,
-                provider=provider_name,
-                model=resolved_model,
-                sdk_type=body.call_sdk,
-                messages=messages_raw,
-                endpoint="/v1/chat/completions",
-                kind="chat",
-                stream=False,
-                metadata={"source": "chat-gateway"},
-            )
-            await db.commit()
+            # OPTIMIZATION: Generate IDs upfront and notify agent immediately
+            query_id = f"q_{uuid.uuid4().hex[:12]}"
+            job_id = f"j_{uuid.uuid4().hex[:12]}"
+            
+            # 1. Notify agent FIRST (before DB writes for speed)
             try:
                 await agent_ws_manager.notify(
                     credential.principal_id,
                     {
                         "type": "job_available",
                         "agent_id": credential.principal_id,
-                        "job_id": job_row.id,
+                        "query_id": query_id,
+                        "job_id": job_id,
+                        "model": resolved_model,
+                        "messages": messages_raw,
+                        "endpoint": "/v1/chat/completions",
+                        "kind": "chat",
+                        "metadata": {"source": "chat-gateway"},
                     },
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Failed to notify agent via websocket: {exc}")
+            
+            # 2. Store in DB asynchronously (fire-and-forget for speed)
+            asyncio.create_task(
+                _persist_agent_job_async(
+                    query_id=query_id,
+                    job_id=job_id,
+                    agent_id=credential.principal_id,
+                    user_id=credential.user_id,
+                    provider=provider_name,
+                    model=resolved_model,
+                    sdk_type=body.call_sdk,
+                    messages=messages_raw,
+                )
+            )
+            
+            # 3. Wait for result (agent already started processing!)
             return await _wait_for_agent_result(
-                query_row=query_row,
-                job_id=job_row.id,
+                query_id=query_id,
+                job_id=job_id,
                 agent_id=credential.principal_id,
                 timeout_seconds=900,
             )
@@ -193,28 +196,91 @@ async def chat_completions(
     )
 
 
+async def _persist_agent_job_async(
+    *,
+    query_id: str,
+    job_id: str,
+    agent_id: str,
+    user_id: str | None,
+    provider: str,
+    model: str,
+    sdk_type: str | None,
+    messages: list[dict],
+) -> None:
+    """Persist job to database asynchronously (non-blocking for speed)."""
+    try:
+        async with async_session_factory() as db:
+            # Save query
+            query_row = QueryRow(
+                id=query_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                provider=provider,
+                model=model,
+                sdk_type=sdk_type,
+                input_messages=json.dumps(messages),
+                endpoint="/v1/chat/completions",
+                timestamp=_dt.datetime.now(_dt.timezone.utc),
+            )
+            db.add(query_row)
+            
+            # Save job
+            job_row = AgentJobRow(
+                id=job_id,
+                query_id=query_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                provider=provider,
+                model=model,
+                sdk_type=sdk_type,
+                endpoint="/v1/chat/completions",
+                kind="chat",
+                input_payload=json.dumps({"messages": messages}),
+                stream=False,
+                metadata_=json.dumps({"source": "chat-gateway"}),
+                status="running",  # Already running!
+                attempt_count=1,
+            )
+            db.add(job_row)
+            await db.commit()
+            logger.info(f"Persisted agent job {job_id} for query {query_id}")
+    except Exception as exc:
+        logger.error(f"Failed to persist agent job {job_id}: {exc}")
+
+
 async def _wait_for_agent_result(
     *,
-    query_row: QueryRow,
+    query_id: str,
     job_id: str,
     agent_id: str,
     timeout_seconds: int = 120,
 ) -> ChatCompletionResponse:
     deadline = time.perf_counter() + timeout_seconds
     last_job_row: AgentJobRow | None = None
+    query_row: QueryRow | None = None
+    
     while time.perf_counter() < deadline:
         async with async_session_factory() as poll_db:
             response_result = await poll_db.execute(
-                select(ResponseRow).where(ResponseRow.query_id == query_row.id)
+                select(ResponseRow).where(ResponseRow.query_id == query_id)
             )
             response_row = response_result.scalars().first()
+            
             job_result = await poll_db.execute(
                 select(AgentJobRow).where(AgentJobRow.id == job_id)
             )
             job_row = job_result.scalars().first()
+            
+            # Also get query_row for response building
+            query_result = await poll_db.execute(
+                select(QueryRow).where(QueryRow.id == query_id)
+            )
+            query_row = query_result.scalars().first()
+            
             if job_row is not None:
                 last_job_row = job_row
-            if response_row and job_row:
+                
+            if response_row and job_row and query_row:
                 if response_row.status_code >= 400 or job_row.status in {"failed", "cancelled"}:
                     raise HTTPException(
                         status_code=502,
@@ -239,13 +305,13 @@ async def _wait_for_agent_result(
                     status_code=502,
                     detail=job_row.error_message or "Agent job failed",
                 )
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)  # Faster polling (500ms instead of 1s)
 
     raise HTTPException(
         status_code=504,
         detail={
-            "message": "Agent job is still queued",
-            "query_id": query_row.id,
+            "message": "Agent job timeout",
+            "query_id": query_id,
             "job_id": job_id,
             "agent_id": agent_id,
             "last_status": last_job_row.status if last_job_row else "missing",
