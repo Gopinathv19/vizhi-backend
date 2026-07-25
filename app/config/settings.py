@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     #----- Sync settings for the local to the server -----
 
     sync_enabled: bool = True
-    sync_interval:int = 30
-    sync_batch_size: int = 100
+    sync_interval: int = 30          # How often background sync runs (seconds)
+    sync_batch_size: int = 100       # Max rows per sync batch
+    cache_ttl_seconds: int = 300     # TTL for lazy agent/model_connection cache (5 min)
 
     
 

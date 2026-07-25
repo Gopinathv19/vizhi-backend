@@ -20,7 +20,7 @@ from app.auth.user_auth import (
     verify_google_id_token,
     verify_password,
 )
-from app.db.session import get_db
+from app.db.session import get_cloud_db
 from app.models.db_models import UserRow
 from app.schemas.requests import GoogleLoginRequest, LoginRequest, SignupRequest
 from app.schemas.responses import AuthResponse, UserResponse
@@ -32,7 +32,7 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
 async def signup(
     body: SignupRequest,
     response: Response,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_cloud_db),
 ) -> AuthResponse:
     email = normalize_email(body.email)
     user = await find_user_by_email(db, email)
@@ -52,7 +52,7 @@ async def signup(
 async def login(
     body: LoginRequest,
     response: Response,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_cloud_db),
 ) -> AuthResponse:
     email = normalize_email(body.email)
     user = await find_user_by_email(db, email)
@@ -78,7 +78,7 @@ async def login(
 async def google_login(
     body: GoogleLoginRequest,
     response: Response,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_cloud_db),
 ) -> AuthResponse:
     identity = await verify_google_id_token(body.id_token)
     google_account = await find_auth_account(

@@ -71,3 +71,29 @@ async def get_remote_db() -> AsyncSession | None:  # type: ignore[misc]
         except Exception:
             await session.rollback()
             raise
+
+
+async def get_cloud_db() -> AsyncSession:  # type: ignore[misc]
+    """
+    FastAPI dependency that yields a CLOUD (remote PostgreSQL) session.
+
+    Used exclusively by cloud-only tables: users, auth_accounts.
+    Falls back to local DB if remote is not configured (dev/offline mode).
+    """
+    if remote_session_factory is not None:
+        async with remote_session_factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    else:
+        # Fallback: use local DB in dev/offline mode
+        async with local_session_factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_key import generate_api_key, hash_api_key, mask_api_key
 from app.auth.user_auth import get_current_user
+from app.db.cache_service import cache_service
 from app.db.session import get_db
 from app.models.db_models import ModelConnectionRow, UserRow
 from app.schemas.requests import CreateModelConnectionRequest
@@ -142,6 +143,7 @@ async def create_model_connection(
     db.add(row)
     await db.flush()
     await db.commit()
+    cache_service.invalidate_models()  # invalidate so next read pulls fresh data
 
     return ModelConnectionCreatedResponse(
         model_connection=_row_to_response(row),
@@ -171,6 +173,7 @@ async def revoke_model_connection(
     row.status = "revoked"
     await db.flush()
     await db.refresh(row)
+    cache_service.invalidate_models()
     return _row_to_response(row)
 
 
@@ -204,6 +207,7 @@ async def rotate_model_connection(
 
     await db.flush()
     await db.refresh(row)
+    cache_service.invalidate_models()
 
     return ModelConnectionRotatedResponse(
         model_connection=_row_to_response(row),
@@ -217,6 +221,7 @@ async def list_models(
     db: AsyncSession = Depends(get_db),
 ) -> list[ModelConnectionResponse]:
     """List all registered model connections."""
+    await cache_service.ensure_models_fresh()  # refresh from remote if TTL expired
     result = await db.execute(
         select(ModelConnectionRow)
         .where(ModelConnectionRow.user_id == user.id)
@@ -384,3 +389,4 @@ async def delete_model_connection(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model connection not found")
     await db.delete(row)
     await db.commit()
+    cache_service.invalidate_models()
