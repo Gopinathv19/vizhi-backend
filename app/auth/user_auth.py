@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
-from app.db.session import get_db
+from app.db.session import get_cloud_db
 from app.models.db_models import AuthAccountRow, UserRow
 from app.schemas.responses import UserResponse
 
@@ -122,7 +122,7 @@ def resolve_session_token(
 async def get_current_user(
     request: Request,
     authorization: str | None = Security(_auth_header),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_cloud_db),
 ) -> UserRow:
     token = resolve_session_token(request, authorization)
     if not token:

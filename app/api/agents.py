@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_key import generate_api_key, hash_api_key, mask_api_key
 from app.auth.user_auth import get_current_user
+from app.db.cache_service import cache_service
 from app.db.session import get_db
 from app.models.db_models import AgentRow, UserRow
 from app.schemas.requests import CreateAgentRequest, UpdateAgentRequest
@@ -70,6 +71,7 @@ async def create_agent(
     db.add(row)
     await db.flush()
     await db.commit()
+    cache_service.invalidate_agents()  # invalidate so next read pulls fresh data
 
     return AgentCreatedResponse(
         agent=_agent_to_response(row),
@@ -83,6 +85,7 @@ async def list_agents(
     db: AsyncSession = Depends(get_db),
 ) -> list[AgentResponse]:
     """List all agents."""
+    await cache_service.ensure_agents_fresh()  # refresh from remote if TTL expired
     result = await db.execute(
         select(AgentRow)
         .where(AgentRow.user_id == user.id)
@@ -98,6 +101,7 @@ async def get_agent(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Get a single agent by agent_id (CID)."""
+    await cache_service.ensure_agents_fresh()
     result = await db.execute(
         select(AgentRow).where(AgentRow.agent_id == agent_id, AgentRow.user_id == user.id)
     )
@@ -132,6 +136,7 @@ async def update_agent(
         row.status = body.status
 
     await db.flush()
+    cache_service.invalidate_agents()
     return _agent_to_response(row)
 
 
@@ -154,6 +159,7 @@ async def revoke_agent(
     row.status = "revoked"
     await db.flush()
     await db.refresh(row)
+    cache_service.invalidate_agents()
     return _agent_to_response(row)
 
 
@@ -185,7 +191,9 @@ async def rotate_agent(
     # Preserve: name, description, token_name, tags, created_at, last_used_at
 
     await db.flush()
+    await db.commit()   # commit to local SQLite immediately (don't wait for get_db cleanup)
     await db.refresh(row)
+    cache_service.invalidate_agents()  # marks cache fresh → next read serves local data
 
     return AgentRotatedResponse(
         agent=_agent_to_response(row),
@@ -207,3 +215,4 @@ async def delete_agent(
     if not row:
         raise HTTPException(status_code=404, detail="Agent not found")
     await db.delete(row)
+    cache_service.invalidate_agents()
