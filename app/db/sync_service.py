@@ -123,27 +123,28 @@ class SyncService:
 
         if local_count > 0:
             logger.info(
-                f"Local DB already has {local_count} users — skipping hydration"
+                f"Local DB already has {local_count} users — merging remote updates..."
             )
-            return
-
-        logger.info("Local DB is empty — hydrating from remote...")
+        else:
+            logger.info("Local DB is empty — hydrating from remote...")
 
         try:
             async with remote_session_factory() as remote_db:
                 async with local_session_factory() as local_db:
                     total_rows = 0
+                    id_maps: dict[type[Base], dict[str, str]] = {}
                     for model_class in SYNC_TABLES:
-                        count = await self._copy_table(
+                        count = await self._sync_table(
                             source_db=remote_db,
                             target_db=local_db,
                             model_class=model_class,
+                            id_maps=id_maps,
                             direction="remote → local",
                         )
                         total_rows += count
                     await local_db.commit()
 
-            logger.info(f"✅ Hydration complete — {total_rows} total rows pulled")
+            logger.info(f"✅ Hydration complete — {total_rows} total rows merged")
         except Exception as e:
             logger.error(f"❌ Hydration failed: {e}", exc_info=True)
             self._last_error = f"Hydration failed: {e}"
@@ -220,6 +221,8 @@ class SyncService:
                             local_db=local_db,
                             remote_db=remote_db,
                             model_class=model_class,
+                            id_maps=pull_id_maps,
+                            direction="remote → local",
                         )
                         await remote_db.commit()
                 except Exception as e:
@@ -328,6 +331,7 @@ class SyncService:
         source_db: AsyncSession,
         target_db: AsyncSession,
         model_class: Type[Base],
+        id_maps: dict[type[Base], dict[str, str]],
         direction: str = "",
     ) -> int:
         """
@@ -357,7 +361,94 @@ class SyncService:
         if count > 0:
             logger.info(f"  {direction} {model_class.__tablename__}: {count} rows")
 
-        return count
+        if inserted or updated:
+            logger.debug(
+                f"  {direction} {table_name}: +{inserted} inserted, ~{updated} updated"
+            )
+
+        return inserted + updated
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    async def _find_target_row(
+        self,
+        *,
+        target_db: AsyncSession,
+        model_class: Type[Base],
+        row_dict: dict,
+        pk_col_name: str,
+    ) -> Base | None:
+        pk_attr = getattr(model_class, pk_col_name)
+        result = await target_db.execute(
+            select(model_class).where(pk_attr == row_dict[pk_col_name])
+        )
+        target_row = result.scalars().first()
+        if target_row is not None:
+            return target_row
+
+        identity = self._natural_identity(model_class, row_dict)
+        if not identity:
+            return None
+
+        stmt = select(model_class)
+        for col_name, value in identity.items():
+            stmt = stmt.where(getattr(model_class, col_name) == value)
+        result = await target_db.execute(stmt)
+        return result.scalars().first()
+
+    def _natural_identity(
+        self,
+        model_class: Type[Base],
+        row_dict: dict,
+    ) -> dict[str, object] | None:
+        if model_class is UserRow:
+            return {"email": row_dict["email"]}
+        if model_class is AuthAccountRow:
+            if row_dict.get("provider_user_id") is not None:
+                return {
+                    "provider": row_dict["provider"],
+                    "provider_user_id": row_dict["provider_user_id"],
+                }
+            return {
+                "user_id": row_dict["user_id"],
+                "provider": row_dict["provider"],
+            }
+        if model_class is AgentRow:
+            return {"agent_id": row_dict["agent_id"]}
+        if model_class is AgentRuntimeRow:
+            return {"agent_id": row_dict["agent_id"]}
+        if model_class is AgentJobRow:
+            return {"query_id": row_dict["query_id"]}
+        return None
+
+    def _apply_id_maps(
+        self,
+        row_dict: dict,
+        id_maps: dict[type[Base], dict[str, str]],
+    ) -> None:
+        user_id = row_dict.get("user_id")
+        if user_id in id_maps.get(UserRow, {}):
+            row_dict["user_id"] = id_maps[UserRow][user_id]
+
+        agent_id = row_dict.get("agent_id")
+        if agent_id in id_maps.get(AgentRow, {}):
+            row_dict["agent_id"] = id_maps[AgentRow][agent_id]
+
+        query_id = row_dict.get("query_id")
+        if query_id in id_maps.get(QueryRow, {}):
+            row_dict["query_id"] = id_maps[QueryRow][query_id]
+
+    def _update_target_row(
+        self,
+        *,
+        target_row: Base,
+        row_dict: dict,
+        pk_col_name: str,
+    ) -> None:
+        for column in target_row.__table__.columns:
+            if column.name == pk_col_name:
+                continue
+            setattr(target_row, column.name, row_dict[column.name])
 
     # ── Manual Sync (for API/admin endpoints) ───────────────────────
 

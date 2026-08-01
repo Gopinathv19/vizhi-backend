@@ -228,7 +228,6 @@ async def get_agent_budget(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Return the current budget configuration and usage for an agent."""
-    # Verify ownership
     result = await db.execute(
         select(AgentRow).where(AgentRow.agent_id == agent_id, AgentRow.user_id == user.id)
     )

@@ -141,8 +141,12 @@ _MODEL_CATALOG: list[dict] = [
         ],
     },
     {
+        "id": "deepseek",   
+        "label": "DeepSeek",
         "id": "deepseek",
         "label": "DeepSeek (via HuggingFace)",
+        "id": "deepseek",   
+        "label": "DeepSeek",
         "models": [
             {
                 "id": "deepseek/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
