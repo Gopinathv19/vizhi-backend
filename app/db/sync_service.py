@@ -134,7 +134,7 @@ class SyncService:
                     total_rows = 0
                     id_maps: dict[type[Base], dict[str, str]] = {}
                     for model_class in SYNC_TABLES:
-                        count = await self._sync_table(
+                        count = await self._copy_table(
                             source_db=remote_db,
                             target_db=local_db,
                             model_class=model_class,
@@ -221,8 +221,6 @@ class SyncService:
                             local_db=local_db,
                             remote_db=remote_db,
                             model_class=model_class,
-                            id_maps=pull_id_maps,
-                            direction="remote → local",
                         )
                         await remote_db.commit()
                 except Exception as e:
@@ -361,14 +359,7 @@ class SyncService:
         if count > 0:
             logger.info(f"  {direction} {model_class.__tablename__}: {count} rows")
 
-        if inserted or updated:
-            logger.debug(
-                f"  {direction} {table_name}: +{inserted} inserted, ~{updated} updated"
-            )
-
-        return inserted + updated
-
-    # ── Helpers ──────────────────────────────────────────────────────
+        return count
 
     async def _find_target_row(
         self,
