@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     custom_inference_api_key: str = ""
     custom_inference_base_url: str = ""
 
+    # ── Automatic Provider Fallback ─────────────────────────────────────
+    # Whether automatic fallback across providers is enabled (default: on).
+    fallback_enabled: bool = True
+    # Max times to retry the SAME provider before moving to the next one.
+    fallback_max_retries_per_provider: int = 2
+    # Base delay in seconds for exponential backoff between retries.
+    fallback_base_backoff_seconds: float = 1.0
+
     # ── Legacy provider API keys ────────────────────────────────────────
     openai_api_key: str = ""
     anthropic_api_key: str = ""

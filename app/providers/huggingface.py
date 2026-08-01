@@ -1,4 +1,13 @@
-"""OpenAI logical provider adapter."""
+"""HuggingFace Inference Router provider adapter.
+
+Routes to https://router.huggingface.co/v1 — a free tier that serves
+popular open-source models (Llama, Mistral, Qwen, DeepSeek, etc.)
+with no additional API key beyond your HF token.
+
+No model mapping is performed: the model name passed in is forwarded
+directly to HuggingFace.  If the model string contains the `:fastest`
+suffix hint it is kept as-is.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +20,8 @@ from app.providers.final_call import (
 )
 
 
-class OpenAIProvider(BaseProvider):
-    provider_name = "openai"
+class HuggingFaceProvider(BaseProvider):
+    provider_name = "huggingface"
 
     async def chat_completion(
         self,

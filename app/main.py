@@ -13,10 +13,15 @@ from app.api.agents import router as agents_router
 from app.api.agent_queue import router as agent_queue_router
 from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
+from app.api.health import router as health_router
 from app.api.models import router as models_router
 from app.api.queries import router as queries_router
 from app.api.metrics import router as metrics_router
 from app.api.dashboard import router as dashboard_router
+from app.services.health_checker import (
+    start_background_health_checks,
+    stop_background_health_checks,
+)
 
 
 @asynccontextmanager
@@ -32,9 +37,13 @@ async def lifespan(app: FastAPI):
     # 3. Start background sync loop (local → remote, every N seconds)
     await sync_service.start()
 
+    # 4. Start provider health-check background loop
+    start_background_health_checks()
+
     yield
 
-    # 4. On shutdown: final flush of pending data to remote
+    # 5. On shutdown: stop health checks and flush pending data to remote
+    stop_background_health_checks()
     await sync_service.stop()
 
 
@@ -61,6 +70,7 @@ app.include_router(agent_queue_router)
 app.include_router(chat_router)
 app.include_router(models_router)
 app.include_router(queries_router)
+app.include_router(health_router)
 app.include_router(metrics_router)
 app.include_router(dashboard_router)
 

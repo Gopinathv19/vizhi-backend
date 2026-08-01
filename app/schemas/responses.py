@@ -42,6 +42,10 @@ class VizhiMetadata(BaseModel):
     provider: str
     latency_ms: int
     query_id: str
+    # Fallback metadata — present when automatic provider fallback kicked in
+    used_fallback: bool = False
+    fallback_attempts: list[str] = Field(default_factory=list)
+    original_provider: str | None = None
 
 
 class ChatCompletionResponse(BaseModel):

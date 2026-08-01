@@ -29,6 +29,14 @@ class ChatCompletionRequest(BaseModel):
     )
     temperature: float = Field(1.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(None, ge=1, le=128_000)
+    stream: bool = Field(
+        False,
+        description=(
+            "When true, the response is streamed as Server-Sent Events (SSE). "
+            "Each chunk is an OpenAI-compatible `data: {...}` line terminated "
+            "by `data: [DONE]`."
+        ),
+    )
 
 
 # ── Frontend Authentication ─────────────────────────────────────────────

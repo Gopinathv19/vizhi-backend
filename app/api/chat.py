@@ -9,8 +9,10 @@ import json
 import logging
 import time
 import uuid
+from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +33,9 @@ from app.services.persistence import (
     persist_query,
     persist_response,
 )
-from app.services.router import provider_router
+from app.config.settings import settings
+from app.services.router import provider_router, FallbackResult
+from app.services.budget import check_agent_budget, check_model_budget
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -64,19 +68,25 @@ async def chat_completions(
             detail="Model is required when using an agent token",
         )
 
+    # ── Pre-flight budget check ─────────────────────────────────────────
+    # Raises HTTP 429 immediately if the caller has exceeded their spending limit.
+    # Budget checks are skipped when no limit is configured (None → unlimited).
     if credential.token_type == "agent":
-        provider_name = "agent"
-        resolved_model = model_name
-        provider = None
+        await check_agent_budget(db, agent_id=credential.principal_id)
     else:
-        try:
-            provider, resolved_model = provider_router.resolve(model_name, body.call_sdk)
-            provider_name = provider.provider_name
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        await check_model_budget(db, model_connection_id=credential.principal_id)
 
-    messages_raw = [m.model_dump() for m in body.messages]
+    # ── Agent token path: queue job to on-site agent ────────────────────
     if credential.token_type == "agent":
+        # Resolve provider name for persisting the query (no actual call yet)
+        try:
+            _tmp_provider, resolved_model = provider_router.resolve(model_name, body.call_sdk)
+            provider_name = _tmp_provider.provider_name
+        except ValueError:
+            provider_name = "agent"
+            resolved_model = model_name
+
+        messages_raw = [m.model_dump() for m in body.messages]
         try:
             # OPTIMIZATION: Generate IDs upfront and notify agent immediately
             query_id = f"q_{uuid.uuid4().hex[:12]}"
@@ -131,6 +141,80 @@ async def chat_completions(
                 detail=f"Agent queue request failed: {exc}",
             ) from exc
 
+    # ── Streaming path (model token only) ──────────────────────────────
+    if body.stream and credential.token_type != "agent":
+        # Validate provider before opening the stream
+        try:
+            _primary_provider, _primary_model = provider_router.resolve(model_name, body.call_sdk)
+            provider_name = _primary_provider.provider_name
+            resolved_model = _primary_model
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        messages_raw = [m.model_dump() for m in body.messages]
+        query_row = await persist_query(
+            db,
+            agent_id=credential.principal_id,
+            user_id=credential.user_id,
+            provider=provider_name,
+            model=resolved_model,
+            sdk_type=body.call_sdk,
+            messages=messages_raw,
+        )
+        await db.commit()
+
+        async def _event_stream() -> AsyncGenerator[bytes, None]:
+            try:
+                if settings.fallback_enabled:
+                    gen = provider_router.chat_with_fallback_stream(
+                        model=model_name,
+                        messages=messages_raw,
+                        call_sdk=body.call_sdk,
+                        temperature=body.temperature,
+                        max_tokens=body.max_tokens,
+                        max_retries_per_provider=settings.fallback_max_retries_per_provider,
+                        base_backoff_seconds=settings.fallback_base_backoff_seconds,
+                    )
+                else:
+                    gen = _primary_provider.chat_completion_stream(
+                        model=resolved_model,
+                        messages=messages_raw,
+                        temperature=body.temperature,
+                        max_tokens=body.max_tokens,
+                    )
+
+                async for line in gen:
+                    yield (line + "\n\n").encode()
+
+            except Exception as exc:
+                logger.exception("Streaming error for query=%s", query_row.id)
+                error_payload = json.dumps({
+                    "error": {"message": str(exc), "type": "stream_error"},
+                })
+                yield (f"data: {error_payload}\n\n").encode()
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Vizhi-Query-Id": query_row.id,
+            },
+        )
+
+    # ── Model token path: direct provider call with automatic fallback ───
+    messages_raw = [m.model_dump() for m in body.messages]
+
+    # Validate model resolves before persisting the query
+    try:
+        _primary_provider, _primary_model = provider_router.resolve(model_name, body.call_sdk)
+        provider_name = _primary_provider.provider_name
+        resolved_model = _primary_model
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     start = time.perf_counter_ns()
     query_row = await persist_query(
         db,
@@ -141,14 +225,48 @@ async def chat_completions(
         sdk_type=body.call_sdk,
         messages=messages_raw,
     )
+
     try:
-        assert provider is not None
-        result = await provider.chat_completion(
-            model=resolved_model,
-            messages=messages_raw,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        )
+        # chat_with_fallback() automatically retries on the primary provider
+        # and then waterfalls through the fallback chain on failure.
+        # Respects FALLBACK_ENABLED / FALLBACK_MAX_RETRIES_PER_PROVIDER /
+        # FALLBACK_BASE_BACKOFF_SECONDS from .env / environment.
+        if settings.fallback_enabled:
+            fallback_result: FallbackResult = await provider_router.chat_with_fallback(
+                model=model_name,
+                messages=messages_raw,
+                call_sdk=body.call_sdk,
+                temperature=body.temperature,
+                max_tokens=body.max_tokens,
+                max_retries_per_provider=settings.fallback_max_retries_per_provider,
+                base_backoff_seconds=settings.fallback_base_backoff_seconds,
+            )
+        else:
+            # Fallback disabled — call the primary provider directly (original behaviour).
+            assert _primary_provider is not None
+            result_direct = await _primary_provider.chat_completion(
+                model=resolved_model,
+                messages=messages_raw,
+                temperature=body.temperature,
+                max_tokens=body.max_tokens,
+            )
+            from app.services.router import FallbackResult as _FR, ProviderResponse  # noqa
+            fallback_result = _FR(
+                response=result_direct,
+                final_provider=provider_name,
+                final_model=resolved_model,
+                used_fallback=False,
+            )
+        result = fallback_result.response
+
+        if fallback_result.used_fallback:
+            logger.warning(
+                "Fallback triggered for query=%s: original_provider=%s → final_provider=%s",
+                query_row.id,
+                provider_name,
+                fallback_result.final_provider,
+            )
+
     except Exception as exc:
         latency = (time.perf_counter_ns() - start) // 1_000_000
         await persist_response(
@@ -161,7 +279,7 @@ async def chat_completions(
         await db.commit()
         raise HTTPException(
             status_code=502,
-            detail=f"Provider error: {exc}",
+            detail=f"All providers failed: {exc}",
         )
 
     await persist_response(
@@ -189,9 +307,12 @@ async def chat_completions(
         ),
         vizhi_metadata=VizhiMetadata(
             agent_id=credential.principal_id,
-            provider=result.provider,
+            provider=fallback_result.final_provider,
             latency_ms=result.latency_ms,
             query_id=query_row.id,
+            used_fallback=fallback_result.used_fallback,
+            fallback_attempts=fallback_result.fallback_attempts,
+            original_provider=provider_name if fallback_result.used_fallback else None,
         ),
     )
 

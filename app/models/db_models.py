@@ -72,6 +72,10 @@ class AgentRow(Base):
     updated_at: Mapped[_dt.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+    # ── Budget enforcement ─────────────────────────────────────────────
+    budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    budget_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_reset_at: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AgentRuntimeRow(Base):
@@ -116,6 +120,10 @@ class ModelConnectionRow(Base):
     created_at: Mapped[_dt.datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
+    # ── Budget enforcement ─────────────────────────────────────────────
+    budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    budget_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_reset_at: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # ── Queries ─────────────────────────────────────────────────────────────

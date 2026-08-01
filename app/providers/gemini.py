@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import AsyncGenerator
+
 from app.providers.base import BaseProvider, ProviderResponse
-from app.providers.final_call import chat_completion as final_chat_completion
+from app.providers.final_call import (
+    chat_completion as final_chat_completion,
+    chat_completion_stream as final_chat_completion_stream,
+)
 
 
 class GeminiProvider(BaseProvider):
@@ -25,3 +30,21 @@ class GeminiProvider(BaseProvider):
             max_tokens=max_tokens,
             **kwargs,
         )
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: list[dict],
+        temperature: float = 1.0,
+        max_tokens: int | None = None,
+        **kwargs,
+    ) -> AsyncGenerator[str, None]:
+        async for chunk in final_chat_completion_stream(
+            provider_name=self.provider_name,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        ):
+            yield chunk

@@ -1,22 +1,23 @@
+"""
+Dual-DB Sync Service — Background sync between local SQLite and remote PostgreSQL.
+
+Strategy: Write-Behind Cache
+─────────────────────────────
+- All API reads/writes go to local SQLite first (fast, zero-latency)
+- Background task periodically pushes changes to remote PostgreSQL (Supabase)
+- On startup, if local is empty (fresh Docker container), hydrate from remote
+- On shutdown, final flush ensures no data loss
+
+This pattern is commonly known as:
+  • Write-Behind Cache / Write-Through Cache
+  • Edge-to-Cloud Sync (PouchDB↔CouchDB, Firebase offline, Realm Sync)
+  • CQRS with local materialised view
+"""
+
 from __future__ import annotations
-
-"""
-Dual-DB Sync Service — Selective sync between local SQLite and remote PostgreSQL.
-
-Strategy: Write-Behind Cache (Selective)
-─────────────────────────────────────────
-Sync Strategy:
-  • queries, responses, agent_jobs, agent_runtime  →  Synced every 30s (high-frequency)
-  • agents, model_connections                       →  Lazy-loaded with 300s TTL cache
-  • users, auth_accounts                            →  Cloud-only (no local sync)
-
-This avoids unnecessary bandwidth, reduces sync conflicts, and keeps sensitive
-auth data secure in the cloud only.
-"""
 
 import asyncio
 import logging
-import time
 from typing import Type
 
 from sqlalchemy import func, select
@@ -27,6 +28,8 @@ from app.config.settings import settings
 from app.db.session import local_session_factory, remote_session_factory
 from app.models.db_models import (
     Base,
+    UserRow,
+    AuthAccountRow,
     AgentRow,
     AgentRuntimeRow,
     ModelConnectionRow,
@@ -37,32 +40,34 @@ from app.models.db_models import (
 
 logger = logging.getLogger("vizhi.sync")
 
-# ── Tables to sync locally every sync_interval seconds ──────────────────────
-# These are high-frequency write tables — they must be fast (local SQLite).
-# Ordered by FK dependency: parent tables first.
+# Tables to sync, ordered by dependency (parents first so FK constraints pass)
 SYNC_TABLES: list[Type[Base]] = [
-    AgentRow,           # parent of queries/responses/agent_jobs
-    AgentRuntimeRow,    # agent status/heartbeat — frequently updated
-    ModelConnectionRow, # model config — frequently read on every inference
-    QueryRow,           # high-frequency writes per API call
-    ResponseRow,        # paired with every query
-    AgentJobRow,        # agent job tracking
+    UserRow,
+    AuthAccountRow,
+    AgentRow,
+    AgentRuntimeRow,
+    ModelConnectionRow,
+    QueryRow,
+    ResponseRow,
+    AgentJobRow,
 ]
 
-# ── Tables NOT synced locally (cloud-only) ───────────────────────────────────
-# UserRow and AuthAccountRow are kept in the remote DB only.
-# Reason: security (password hashes), real-time auth consistency, no sync conflicts.
-
-# Per-table: additional unique constraint names for conflict resolution
+# Per-table: additional unique constraint names that must be handled with
+# ON CONFLICT DO NOTHING (beyond the primary key which is always upserted).
+# If the remote has a UNIQUE constraint on a column OTHER than the PK, and a
+# local row conflicts on that column with a DIFFERENT PK value (e.g. same email
+# registered twice via different auth flows), we skip that row rather than fail.
 EXTRA_UNIQUE_CONSTRAINTS: dict[str, list[str]] = {
+    "users": ["users_email_key"],
     "agents": ["agents_agent_id_key"],
     "agent_jobs": ["agent_jobs_query_id_key"],
+    "auth_accounts": ["uq_auth_provider_user", "uq_auth_user_provider"],
 }
 
 
 class SyncService:
     """
-    Manages selective one-way sync from local SQLite → remote PostgreSQL (Supabase).
+    Manages one-way sync from local SQLite → remote PostgreSQL (Supabase).
 
     Lifecycle:
       1. hydrate_local_from_remote()  — on container startup (empty local)
@@ -95,8 +100,6 @@ class SyncService:
             "running": self._running,
             "sync_count": self._sync_count,
             "last_error": self._last_error,
-            "synced_tables": [t.__tablename__ for t in SYNC_TABLES],
-            "cloud_only_tables": ["users", "auth_accounts"],
         }
 
     # ── Startup: Hydrate local from remote ──────────────────────────
@@ -104,26 +107,27 @@ class SyncService:
     async def hydrate_local_from_remote(self) -> None:
         """
         On container startup, if the local SQLite is empty,
-        pull only the SYNC_TABLES data from remote PostgreSQL.
+        pull all data from remote PostgreSQL (Supabase).
 
-        users and auth_accounts are NOT hydrated — they stay cloud-only.
+        Skipped if local already has data — avoids overwriting live data
+        on a running instance that merely restarted.
         """
         if not self.is_configured:
             logger.info("Remote DB not configured — skipping hydration")
             return
 
-        # Use AgentRow count as proxy for "is local DB populated?"
+        # Use user count as a proxy for "is local DB populated?"
         async with local_session_factory() as local_db:
-            result = await local_db.execute(select(func.count(AgentRow.id)))
+            result = await local_db.execute(select(func.count(UserRow.id)))
             local_count = result.scalar() or 0
 
         if local_count > 0:
             logger.info(
-                f"Local DB already has {local_count} agents — skipping hydration"
+                f"Local DB already has {local_count} users — skipping hydration"
             )
             return
 
-        logger.info("Local DB is empty — hydrating selected tables from remote...")
+        logger.info("Local DB is empty — hydrating from remote...")
 
         try:
             async with remote_session_factory() as remote_db:
@@ -140,7 +144,6 @@ class SyncService:
                     await local_db.commit()
 
             logger.info(f"✅ Hydration complete — {total_rows} total rows pulled")
-            logger.info("ℹ️  users & auth_accounts are cloud-only — not hydrated locally")
         except Exception as e:
             logger.error(f"❌ Hydration failed: {e}", exc_info=True)
             self._last_error = f"Hydration failed: {e}"
@@ -156,8 +159,8 @@ class SyncService:
         self._running = True
         self._task = asyncio.create_task(self._sync_loop())
         logger.info(
-            f"🔄 Selective sync started (interval: {settings.sync_interval}s, "
-            f"tables: {[t.__tablename__ for t in SYNC_TABLES]})"
+            f"🔄 Sync started (interval: {settings.sync_interval}s, "
+            f"batch_size: {settings.sync_batch_size})"
         )
 
     async def stop(self) -> None:
@@ -201,14 +204,16 @@ class SyncService:
 
     async def _sync_all_tables(self) -> None:
         """
-        Push all SYNC_TABLES local data to remote (local → remote).
+        Push all local data to remote (local → remote).
 
-        users and auth_accounts are intentionally excluded — they are cloud-only.
         Each table gets its OWN remote session so that a failure in one table
-        does NOT poison the session and block the remaining tables from syncing.
+        (e.g. a unique constraint violation) does NOT poison the session and
+        block the remaining tables from syncing.
         """
         async with local_session_factory() as local_db:
             for model_class in SYNC_TABLES:
+                # Fresh session per table — errors in one table cannot
+                # contaminate subsequent tables via a shared rolled-back session.
                 try:
                     async with remote_session_factory() as remote_db:
                         await self._push_table(
@@ -218,6 +223,7 @@ class SyncService:
                         )
                         await remote_db.commit()
                 except Exception as e:
+                    # Log and continue — don't let one bad table stop the rest
                     logger.error(
                         f"Failed to sync {model_class.__tablename__}: {e}",
                         exc_info=True,
@@ -231,10 +237,13 @@ class SyncService:
         model_class: Type[Base],
     ) -> None:
         """
-        Sync a single table from local → remote using PostgreSQL UPSERT.
+        Sync a single table from local → remote using a true PostgreSQL UPSERT.
 
-        Executes one row at a time to avoid SQLAlchemy compilation issues.
+        Uses INSERT ... ON CONFLICT (pk) DO UPDATE SET ... executed one row at a
+        time to avoid SQLAlchemy compilation issues with list-valued .values().
+        Each row is safely upserted without unique constraint errors.
         """
+        # Fetch all local rows
         local_result = await local_db.execute(select(model_class))
         local_rows = local_result.scalars().all()
 
@@ -244,10 +253,13 @@ class SyncService:
         table = model_class.__table__
         pk_col_name = list(table.primary_key.columns)[0].name
 
+        # Column names to update on conflict (everything except the PK)
         update_col_names = [
             col.name for col in table.columns if col.name != pk_col_name
         ]
 
+        # Pre-build the mapper: db column name → ORM attribute key
+        # This correctly resolves aliases like metadata_ → "metadata" column.
         mapper = model_class.__mapper__
         col_to_attr: dict[str, str] = {}
         for prop in mapper.column_attrs:
@@ -262,6 +274,9 @@ class SyncService:
                 for col_name, attr_key in col_to_attr.items()
             }
 
+            # Build a fresh statement per row — avoids the MetaData/_is_bind_parameter
+            # bug that occurs when pg_insert().values(list_of_dicts) is used with
+            # .on_conflict_do_update() referencing stmt.excluded on a pre-built stmt.
             stmt = pg_insert(table).values(**row_dict)
 
             if update_col_names:
@@ -277,6 +292,13 @@ class SyncService:
                 upserted += 1
             except Exception as row_err:
                 err_str = str(row_err)
+                # FK violation: parent row not yet in remote — skip silently,
+                # it will be retried on the next sync cycle once the parent syncs.
+                # UniqueViolation on a NON-PK constraint (e.g. users_email_key):
+                # The same email exists in remote under a different id.
+                # Skip the local row — the remote version takes precedence.
+                # Schema error (UndefinedColumn): remote table is missing a column —
+                # user must run the migration SQL in Supabase SQL Editor.
                 await remote_db.rollback()
                 if "ForeignKeyViolationError" in err_str or "UniqueViolationError" in err_str:
                     skipped += 1
@@ -284,8 +306,10 @@ class SyncService:
                     col_hint = err_str.split("column")[-1].split("of")[0].strip().strip('"')
                     logger.warning(
                         f"  ⚠️  Remote {model_class.__tablename__} is missing column "
-                        f'"{col_hint}". Run migrations in Supabase SQL Editor to fix this.'
+                        f'"{col_hint}". Run migrations/remote_supabase_schema_sync.sql '
+                        f"in Supabase SQL Editor to fix this."
                     )
+                    # Skip remaining rows for this table — all will fail the same way
                     break
                 else:
                     raise
@@ -294,7 +318,7 @@ class SyncService:
             logger.info(
                 f"  ✅ {model_class.__tablename__}: "
                 f"{upserted} upserted"
-                + (f", {skipped} skipped" if skipped else "")
+                + (f", {skipped} skipped (FK not yet synced)" if skipped else "")
             )
 
     # ── Helpers ──────────────────────────────────────────────────────
@@ -308,11 +332,13 @@ class SyncService:
     ) -> int:
         """
         Copy all rows from source to target for a given model.
-        Used only during hydration (startup).
+        Used only during hydration (startup). Does not check for conflicts —
+        assumes target is empty.
         """
         result = await source_db.execute(select(model_class))
         rows = result.scalars().all()
 
+        # Build mapper: db column name → ORM attribute key (handles aliases like metadata_)
         mapper = model_class.__mapper__
         col_to_attr: dict[str, str] = {}
         for prop in mapper.column_attrs:
@@ -333,7 +359,7 @@ class SyncService:
 
         return count
 
-    # ── Manual Sync (for API/admin endpoints) ────────────────────────
+    # ── Manual Sync (for API/admin endpoints) ───────────────────────
 
     async def force_sync(self) -> dict:
         """Trigger an immediate sync (useful for admin endpoints)."""

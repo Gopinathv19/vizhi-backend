@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_key import generate_api_key, hash_api_key, mask_api_key
 from app.auth.user_auth import get_current_user
-from app.db.cache_service import cache_service
 from app.db.session import get_db
 from app.models.db_models import ModelConnectionRow, UserRow
 from app.schemas.requests import CreateModelConnectionRequest
@@ -22,11 +23,13 @@ from app.schemas.responses import (
     ModelUsageStats,
     QueryDetailItem,
 )
+from app.services.budget import get_model_budget_status
 
 router = APIRouter(prefix="/v1/models", tags=["models"])
 
 
 _MODEL_CATALOG: list[dict] = [
+    # ── Paid / API-key providers ──────────────────────────────────────────
     {
         "id": "openai",
         "label": "OpenAI",
@@ -43,7 +46,7 @@ _MODEL_CATALOG: list[dict] = [
     },
     {
         "id": "claude",
-        "label": "Claude",
+        "label": "Claude (Anthropic)",
         "models": [
             {"id": "anthropic/claude-sonnet-4-20250514", "label": "claude-sonnet-4"},
             {"id": "anthropic/claude-3-5-sonnet-20241022", "label": "claude-3.5-sonnet"},
@@ -52,8 +55,66 @@ _MODEL_CATALOG: list[dict] = [
         ],
     },
     {
+        "id": "gemini",
+        "label": "Gemini (Google)",
+        "models": [
+            {"id": "gemini/gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+            {"id": "gemini/gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+            {"id": "gemini/gemini-2.0-flash", "label": "Gemini 2.0 Flash"},
+            {"id": "gemini/gemini-1.5-pro", "label": "Gemini 1.5 Pro"},
+            {"id": "gemini/gemini-1.5-flash", "label": "Gemini 1.5 Flash"},
+        ],
+    },
+    {
+        "id": "qwen",
+        "label": "Qwen (Alibaba)",
+        "models": [
+            {"id": "qwen/qwen-plus", "label": "Qwen Plus"},
+            {"id": "qwen/qwen-turbo", "label": "Qwen Turbo"},
+            {"id": "qwen/qwen-max", "label": "Qwen Max"},
+            {"id": "qwen/qwen2.5-72b-instruct", "label": "Qwen 2.5 72B Instruct"},
+            {"id": "qwen/qwen2.5-32b-instruct", "label": "Qwen 2.5 32B Instruct"},
+        ],
+    },
+    # ── Free / Open Models via HuggingFace ────────────────────────────────
+    {
+        "id": "huggingface",
+        "label": "🤗 Open Models (Free via HuggingFace)",
+        "models": [
+            {
+                "id": "huggingface/meta-llama/Llama-3.1-8B-Instruct",
+                "label": "Llama 3.1 8B Instruct (Free)",
+            },
+            {
+                "id": "huggingface/meta-llama/Llama-3.2-3B-Instruct",
+                "label": "Llama 3.2 3B Instruct (Free)",
+            },
+            {
+                "id": "huggingface/mistralai/Mistral-7B-Instruct-v0.3",
+                "label": "Mistral 7B Instruct (Free)",
+            },
+            {
+                "id": "huggingface/mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "label": "Mixtral 8x7B MoE (Free)",
+            },
+            {
+                "id": "huggingface/Qwen/Qwen2.5-7B-Instruct",
+                "label": "Qwen 2.5 7B Instruct (Free)",
+            },
+            {
+                "id": "huggingface/Qwen/Qwen2.5-Coder-7B-Instruct",
+                "label": "Qwen 2.5 Coder 7B (Free)",
+            },
+            {
+                "id": "huggingface/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                "label": "DeepSeek R1 Distill 7B (Free)",
+            },
+        ],
+    },
+    # ── Legacy named providers (kept for backward compat) ─────────────────
+    {
         "id": "llama",
-        "label": "Llama",
+        "label": "Llama (via HuggingFace)",
         "models": [
             {
                 "id": "llama/meta-llama/Llama-3.1-8B-Instruct",
@@ -67,7 +128,7 @@ _MODEL_CATALOG: list[dict] = [
     },
     {
         "id": "mistral",
-        "label": "Mistral",
+        "label": "Mistral (via HuggingFace)",
         "models": [
             {
                 "id": "mistral/mistralai/Mistral-7B-Instruct-v0.3",
@@ -80,8 +141,8 @@ _MODEL_CATALOG: list[dict] = [
         ],
     },
     {
-        "id": "deepseek",   
-        "label": "DeepSeek",
+        "id": "deepseek",
+        "label": "DeepSeek (via HuggingFace)",
         "models": [
             {
                 "id": "deepseek/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -143,7 +204,6 @@ async def create_model_connection(
     db.add(row)
     await db.flush()
     await db.commit()
-    cache_service.invalidate_models()  # invalidate so next read pulls fresh data
 
     return ModelConnectionCreatedResponse(
         model_connection=_row_to_response(row),
@@ -173,7 +233,6 @@ async def revoke_model_connection(
     row.status = "revoked"
     await db.flush()
     await db.refresh(row)
-    cache_service.invalidate_models()
     return _row_to_response(row)
 
 
@@ -207,7 +266,6 @@ async def rotate_model_connection(
 
     await db.flush()
     await db.refresh(row)
-    cache_service.invalidate_models()
 
     return ModelConnectionRotatedResponse(
         model_connection=_row_to_response(row),
@@ -221,7 +279,6 @@ async def list_models(
     db: AsyncSession = Depends(get_db),
 ) -> list[ModelConnectionResponse]:
     """List all registered model connections."""
-    await cache_service.ensure_models_fresh()  # refresh from remote if TTL expired
     result = await db.execute(
         select(ModelConnectionRow)
         .where(ModelConnectionRow.user_id == user.id)
@@ -389,4 +446,68 @@ async def delete_model_connection(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model connection not found")
     await db.delete(row)
     await db.commit()
-    cache_service.invalidate_models()
+
+
+# ── Budget endpoints ─────────────────────────────────────────────────────
+
+class ModelBudgetUpdateRequest(BaseModel):
+    budget_usd: Optional[float] = None
+    budget_tokens: Optional[int] = None
+    budget_reset_at: Optional[str] = None
+    clear: bool = False
+
+
+@router.get("/{model_id}/budget")
+async def get_model_budget(
+    model_id: str,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the current budget configuration and usage for a model token."""
+    result = await db.execute(
+        select(ModelConnectionRow).where(
+            ModelConnectionRow.id == model_id,
+            ModelConnectionRow.user_id == user.id,
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Model connection not found")
+    return await get_model_budget_status(db, model_id)
+
+
+@router.patch("/{model_id}/budget")
+async def update_model_budget(
+    model_id: str,
+    body: ModelBudgetUpdateRequest,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Set or clear the spending budget for a model token.
+
+    Send `clear: true` to remove all limits.
+    """
+    result = await db.execute(
+        select(ModelConnectionRow).where(
+            ModelConnectionRow.id == model_id,
+            ModelConnectionRow.user_id == user.id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Model connection not found")
+
+    if body.clear:
+        row.budget_usd = None
+        row.budget_tokens = None
+        row.budget_reset_at = None
+    else:
+        if body.budget_usd is not None:
+            row.budget_usd = body.budget_usd
+        if body.budget_tokens is not None:
+            row.budget_tokens = body.budget_tokens
+        if body.budget_reset_at is not None:
+            row.budget_reset_at = body.budget_reset_at
+
+    await db.commit()
+    await db.refresh(row)
+    return await get_model_budget_status(db, model_id)

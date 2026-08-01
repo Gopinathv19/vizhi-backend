@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_key import generate_api_key, hash_api_key, mask_api_key
 from app.auth.user_auth import get_current_user
-from app.db.cache_service import cache_service
 from app.db.session import get_db
 from app.models.db_models import AgentRow, UserRow
 from app.schemas.requests import CreateAgentRequest, UpdateAgentRequest
 from app.schemas.responses import AgentCreatedResponse, AgentResponse, AgentRotatedResponse
+from app.services.budget import get_agent_budget_status
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
@@ -71,7 +73,6 @@ async def create_agent(
     db.add(row)
     await db.flush()
     await db.commit()
-    cache_service.invalidate_agents()  # invalidate so next read pulls fresh data
 
     return AgentCreatedResponse(
         agent=_agent_to_response(row),
@@ -85,7 +86,6 @@ async def list_agents(
     db: AsyncSession = Depends(get_db),
 ) -> list[AgentResponse]:
     """List all agents."""
-    await cache_service.ensure_agents_fresh()  # refresh from remote if TTL expired
     result = await db.execute(
         select(AgentRow)
         .where(AgentRow.user_id == user.id)
@@ -101,7 +101,6 @@ async def get_agent(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Get a single agent by agent_id (CID)."""
-    await cache_service.ensure_agents_fresh()
     result = await db.execute(
         select(AgentRow).where(AgentRow.agent_id == agent_id, AgentRow.user_id == user.id)
     )
@@ -136,7 +135,6 @@ async def update_agent(
         row.status = body.status
 
     await db.flush()
-    cache_service.invalidate_agents()
     return _agent_to_response(row)
 
 
@@ -159,7 +157,6 @@ async def revoke_agent(
     row.status = "revoked"
     await db.flush()
     await db.refresh(row)
-    cache_service.invalidate_agents()
     return _agent_to_response(row)
 
 
@@ -191,9 +188,7 @@ async def rotate_agent(
     # Preserve: name, description, token_name, tags, created_at, last_used_at
 
     await db.flush()
-    await db.commit()   # commit to local SQLite immediately (don't wait for get_db cleanup)
     await db.refresh(row)
-    cache_service.invalidate_agents()  # marks cache fresh → next read serves local data
 
     return AgentRotatedResponse(
         agent=_agent_to_response(row),
@@ -215,4 +210,64 @@ async def delete_agent(
     if not row:
         raise HTTPException(status_code=404, detail="Agent not found")
     await db.delete(row)
-    cache_service.invalidate_agents()
+
+
+# ── Budget endpoints ────────────────────────────────────────────────────
+
+class BudgetUpdateRequest(BaseModel):
+    budget_usd: Optional[float] = None       # None = remove limit
+    budget_tokens: Optional[int] = None       # None = remove limit
+    budget_reset_at: Optional[str] = None     # ISO-8601 or None
+    clear: bool = False                        # if True, clears all budget limits
+
+
+@router.get("/{agent_id}/budget")
+async def get_agent_budget(
+    agent_id: str,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the current budget configuration and usage for an agent."""
+    # Verify ownership
+    result = await db.execute(
+        select(AgentRow).where(AgentRow.agent_id == agent_id, AgentRow.user_id == user.id)
+    )
+    if not result.scalars().first():
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return await get_agent_budget_status(db, agent_id)
+
+
+@router.patch("/{agent_id}/budget")
+async def update_agent_budget(
+    agent_id: str,
+    body: BudgetUpdateRequest,
+    user: UserRow = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Set or clear the spending budget for an agent.
+
+    Send `clear: true` to remove all limits. Otherwise provide
+    `budget_usd` and/or `budget_tokens` to set limits.
+    """
+    result = await db.execute(
+        select(AgentRow).where(AgentRow.agent_id == agent_id, AgentRow.user_id == user.id)
+    )
+    row = result.scalars().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if body.clear:
+        row.budget_usd = None
+        row.budget_tokens = None
+        row.budget_reset_at = None
+    else:
+        if body.budget_usd is not None:
+            row.budget_usd = body.budget_usd
+        if body.budget_tokens is not None:
+            row.budget_tokens = body.budget_tokens
+        if body.budget_reset_at is not None:
+            row.budget_reset_at = body.budget_reset_at
+
+    await db.commit()
+    await db.refresh(row)
+    return await get_agent_budget_status(db, agent_id)

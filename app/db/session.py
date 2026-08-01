@@ -27,12 +27,19 @@ remote_engine = None
 remote_session_factory = None
 
 if settings.remote_database_url:
+    # Supabase connection pooler requires SSL — pass ssl=True via connect_args
+    # for asyncpg. Without this, the TLS handshake times out silently.
+    _remote_connect_args = {}
+    if "pooler.supabase.com" in settings.remote_database_url:
+        _remote_connect_args["ssl"] = "require"
+
     remote_engine = create_async_engine(
         settings.remote_database_url,
         echo=False,
         pool_size=5,          # Keep connection pool small (free tier friendly)
         max_overflow=2,
         pool_recycle=300,     # Recycle connections every 5 min
+        connect_args=_remote_connect_args,
     )
     remote_session_factory = async_sessionmaker(
         remote_engine,
